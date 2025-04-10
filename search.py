@@ -64,11 +64,9 @@ if __name__ == "__main__":
     search_query = "python programming tutorials"
     
     
-    api_key = "AIzaSyC6D6TQrv7zSiGi6tP55XzQXj5aFA_8B0Q"
-    cx = "272e38f1316d446f2"
     
     # Or use environment variables (recommended)
-    results = google_search(search_query, api_key, cx)
+    results = google_search(search_query)
     
     if results:
         display_search_results(results)
