@@ -5,6 +5,8 @@ from qdrant_client import QdrantClient, models
 import traceback
 import uuid
 
+#WORKS BUT WRONG LENGTH
+
 #os.environ["HTTP_PROXY"] = "http://dc2-proxyuat.seauat.com.vn:8080"
 #os.environ["HTTPS_PROXY"] = "http://dc2-proxyuat.seauat.com.vn:8080"
 
