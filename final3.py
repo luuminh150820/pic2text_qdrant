@@ -6,6 +6,8 @@ import traceback
 import uuid
 import time
 
+#DETAILED BUT NEED FIXING TO WORK
+
 # Configuration
 OUTPUT_FOLDER = "images"
 QDRANT_COLLECTION = "pdf_collection"
