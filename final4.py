@@ -21,9 +21,8 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash")
 
 def get_embedding(text):
-    """Generate embedding for text using Google's embedding API"""
     if not text or len(text.strip()) == 0:
-        print("Warning: Empty text passed to get_embedding")
+        print("Warning: Empty text")
         return [0.0] * VECTOR_SIZE
     
     try:
@@ -33,9 +32,7 @@ def get_embedding(text):
             content=text,
             task_type="retrieval_document"
         )
-        
-        # Debug information about the result structure
-        print(f"Embedding result type: {type(result)}")
+
         
         # Try different approaches to extract the embedding vector
         embedding_values = None
@@ -58,10 +55,6 @@ def get_embedding(text):
         # If result is already a list-like object
         elif isinstance(result, (list, tuple)):
             embedding_values = list(result)
-        
-        # Log the length of the embedding
-        if embedding_values:
-            print(f"Embedding length: {len(embedding_values)}")
             
             # Check if we have a valid embedding length
             if len(embedding_values) == VECTOR_SIZE:
@@ -90,7 +83,6 @@ def get_embedding(text):
         return [0.0] * VECTOR_SIZE
 
 def process_image_to_text(image_path):
-    """Extract text from an image using Gemini model"""
     try:
         with open(image_path, "rb") as image_file:
             image_data = image_file.read()
@@ -113,12 +105,10 @@ def process_image_to_text(image_path):
         return ""
 
 def setup_qdrant_collection(qdrant_client):
-    """Create or reset Qdrant collection"""
     try:
         collections = qdrant_client.get_collections().collections
         collection_names = [c.name for c in collections]
         
-        # Delete existing collection if it exists
         if QDRANT_COLLECTION in collection_names:
             qdrant_client.delete_collection(collection_name=QDRANT_COLLECTION)
             print(f"Deleted existing collection: {QDRANT_COLLECTION}")
@@ -239,8 +229,6 @@ def retrieve_and_generate(qdrant_client, query, collection_name):
         
         Context:
         {context}
-        
-        Please provide a concise, accurate answer based only on the information in the context.
         """
         
         response = model.generate_content(prompt)
@@ -319,7 +307,6 @@ if __name__ == "__main__":
     text_chunks = [all_extracted_text[i:i + 1000] for i in range(0, len(all_extracted_text), 1000)]
     ids = [str(uuid.uuid4()) for _ in range(len(text_chunks))]
     
-    print(f"Split text into {len(text_chunks)} chunks")
     
     # Initialize Qdrant client
     qdrant_client = QdrantClient(location=":memory:")
