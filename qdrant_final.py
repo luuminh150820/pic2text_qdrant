@@ -2,34 +2,34 @@ import os
 import base64
 import re
 import io
+import time
+import uuid
+import traceback
 import numpy as np
-import google.generativeai as genai  # type: ignore
-from qdrant_client import QdrantClient  # type: ignore
-from qdrant_client.http import models  # type: ignore
-import pdf2image  # type: ignore
-from PIL import Image, ImageOps  # type: ignore
-from tqdm import tqdm  # Import tqdm
+import google.generativeai as genai
+from qdrant_client import QdrantClient, models
+from PIL import Image, ImageOps
 
-# Config
+# Configuration
 OUTPUT_FOLDER = "images"
-QDRANT_COLLECTION = "image_text_collection"
+QDRANT_COLLECTION = "pdf_collection"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 OUTPUT_TEXT_FILE = "extracted_text.txt"
 VECTOR_SIZE = 768
 MAX_CHUNK_SIZE = 1000
 MIN_SIMILARITY_SCORE = 0.7
-POPPLER_PATH = r"E:\Minh\poppler-24.08.0\Library\bin"
-PDF_PATH = "input.pdf"
-
-# Image preprocessing config
-MAX_IMAGE_SIZE = (800, 800)  # Reduced max size for faster processing
-BATCH_SIZE = 5  # Number of images to process in one batch
+BATCH_SIZE = 5  # Process 5 images at once
+MAX_IMAGE_SIZE = (800, 800)  # Reduced size for faster processing
 
 # Path for local Qdrant storage
 QDRANT_LOCAL_PATH = os.path.join(os.getcwd(), "qdrant_storage")
 
-if not GEMINI_API_KEY:
+if GEMINI_API_KEY is None:
     raise ValueError("GEMINI_API_KEY environment variable not set.")
+
+# Configure Google Generative AI
+genai.configure(api_key=GEMINI_API_KEY)
+generation_model = genai.GenerativeModel("gemini-2.0-flash")
 
 def preprocess_image(image_path):
     """Preprocess image for better OCR performance"""
@@ -63,40 +63,57 @@ def preprocess_image(image_path):
         with open(image_path, "rb") as f:
             return f.read(), f'image/{os.path.splitext(image_path)[1][1:].lower()}'
 
-def pdf_to_images(pdf_path, output_folder):
-    try:
-        images = pdf2image.convert_from_path(pdf_path, poppler_path=POPPLER_PATH)
-        image_paths = []
-        for i, image in enumerate(images):
-            image_path = os.path.join(output_folder, f"page_{i}.png")
-            image.save(image_path, "PNG")
-            image_paths.append(image_path)
-        print("PDF conversion complete")
-        return image_paths
-    except Exception as e:
-        print(f"Error converting PDF to images: {e}")
-        return []
-
-# Configure Gemini and Qdrant with local storage
-genai.configure(api_key=GEMINI_API_KEY)
-generation_model = genai.GenerativeModel("gemini-2.0-flash")
-embedding_model = genai.GenerativeModel("embedding-001")
-
-# Ensure the local storage directory exists
-os.makedirs(QDRANT_LOCAL_PATH, exist_ok=True)
-
-# Initialize Qdrant with local path
-#qdrant_client = QdrantClient(path=QDRANT_LOCAL_PATH)
-qdrant_client = QdrantClient(location=":memory:")
-
 def get_embedding(text):
-    """Generate embedding for text"""
+    """Generate embedding for text using the correct Gemini embedding API"""
+    if not text or len(text.strip()) == 0:
+        return [0.0] * VECTOR_SIZE
+    
     try:
-        result = embedding_model.generate_content(text)
-        return result.embedding
+        # Use the correct embedding model name format with "models/" prefix
+        result = genai.embed_content(
+            model="models/embedding-001",
+            content=text,
+            task_type="retrieval_document"
+        )
+        
+        # Get the embedding from the result object
+        # The embedding is accessible through the embedding attribute
+        if hasattr(result, "embedding"):
+            # Make sure we convert to a plain Python list of floats
+            embedding_list = list(map(float, result.embedding))
+            
+            # Check if the vector has the right dimension
+            if len(embedding_list) != VECTOR_SIZE:
+                print(f"Warning: Expected embedding of size {VECTOR_SIZE}, got {len(embedding_list)}. Adjusting...")
+                
+                # If too short, pad with zeros
+                if len(embedding_list) < VECTOR_SIZE:
+                    embedding_list.extend([0.0] * (VECTOR_SIZE - len(embedding_list)))
+                # If too long, truncate
+                else:
+                    embedding_list = embedding_list[:VECTOR_SIZE]
+                    
+            return embedding_list
+        else:
+            print(f"Warning: No embedding attribute found in result. Available attributes: {dir(result)}")
+            # Check if we have embeddings instead (plural form)
+            if hasattr(result, "embeddings"):
+                embedding_list = list(map(float, result.embeddings))
+                if len(embedding_list) != VECTOR_SIZE:
+                    print(f"Warning: Expected embedding of size {VECTOR_SIZE}, got {len(embedding_list)}. Adjusting...")
+                    if len(embedding_list) < VECTOR_SIZE:
+                        embedding_list.extend([0.0] * (VECTOR_SIZE - len(embedding_list)))
+                    else:
+                        embedding_list = embedding_list[:VECTOR_SIZE]
+                return embedding_list
+                
+            # Fall back to zero vector
+            print("Could not extract embedding, using zero vector instead")
+            return [0.0] * VECTOR_SIZE
     except Exception as e:
         print(f"Error generating embedding: {e}")
-        return None
+        traceback.print_exc()  # Print full trace for debugging
+        return [0.0] * VECTOR_SIZE
 
 def split_into_sentences(text):
     """Split text into sentences using regex pattern"""
@@ -158,7 +175,7 @@ def process_image_batch(image_paths):
         # First, add all the images with preprocessing
         for image_path in image_paths:
             image_data, mime_type = preprocess_image(image_path)
-            parts.append({"inline_data": {"mime_type": mime_type, "data": image_data}})
+            parts.append({"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_data).decode('utf-8')}})
         
         # Add the prompt text as the last part
         parts.append({"text": "Act like a text scanner. Extract text from each image in order, separated by '---IMAGE BOUNDARY---'. Extract text as it is without analyzing it and without summarizing it."})
@@ -199,7 +216,7 @@ def process_single_image(image_path):
         image_data, mime_type = preprocess_image(image_path)
         
         parts = [
-            {"inline_data": {"mime_type": mime_type, "data": image_data}},
+            {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_data).decode('utf-8')}},
             {"text": "Act like a text scanner. Extract text as it is without analyzing it and without summarizing it."}
         ]
 
@@ -209,58 +226,108 @@ def process_single_image(image_path):
         print(f"Error extracting text from {os.path.basename(image_path)}: {e}")
         return ""
 
-def setup_qdrant_collection():
-    """Create Qdrant collection if it doesn't exist"""
+def setup_qdrant_collection(qdrant_client):
+    """Create or reset Qdrant collection"""
     try:
         collections = qdrant_client.get_collections().collections
-        if QDRANT_COLLECTION not in [c.name for c in collections]:
-            qdrant_client.create_collection(
-                collection_name=QDRANT_COLLECTION,
-                vectors_config=models.VectorParams(
-                    size=VECTOR_SIZE,
-                    distance=models.Distance.COSINE
-                )
+        collection_names = [c.name for c in collections]
+        
+        # Delete existing collection if it exists
+        if QDRANT_COLLECTION in collection_names:
+            qdrant_client.delete_collection(collection_name=QDRANT_COLLECTION)
+            print(f"Deleted existing collection: {QDRANT_COLLECTION}")
+        
+        # Create collection with correct vector configuration
+        qdrant_client.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=models.VectorParams(
+                size=VECTOR_SIZE,
+                distance=models.Distance.COSINE
             )
-            print(f"Created new collection: {QDRANT_COLLECTION}")
+        )
+        print(f"Created new collection: {QDRANT_COLLECTION}")
         return True
     except Exception as e:
         print(f"Error setting up Qdrant collection: {e}")
         return False
 
-def store_chunks_in_qdrant(chunks, metadata):
+def store_chunks_in_qdrant(qdrant_client, chunks, metadata):
     """Store text chunks and their embeddings in Qdrant"""
     try:
-        # Get embeddings for all chunks
-        points = []
-        for i, chunk in enumerate(chunks):
-            embedding = get_embedding(chunk)
-            if embedding:
+        # Process in smaller batches to avoid memory issues
+        batch_size = 10
+        total_chunks = len(chunks)
+        stored_count = 0
+        
+        for batch_start in range(0, total_chunks, batch_size):
+            batch_end = min(batch_start + batch_size, total_chunks)
+            batch_chunks = chunks[batch_start:batch_end]
+            
+            points = []
+            for i, chunk in enumerate(batch_chunks):
+                if not chunk.strip():
+                    continue
+                    
+                # Get embedding for chunk
+                embedding = get_embedding(chunk)
+                
+                # Debug check - make sure embedding is a list of floats
+                if not isinstance(embedding, list):
+                    print(f"Warning: Embedding is not a list. Type: {type(embedding)}")
+                    # Try to convert it to a list
+                    try:
+                        embedding = list(embedding)
+                    except Exception as conv_e:
+                        print(f"Failed to convert embedding to list: {conv_e}")
+                        # Skip this chunk
+                        continue
+                
+                # Additional type check for each element
+                for j, val in enumerate(embedding):
+                    if not isinstance(val, (int, float)):
+                        print(f"Warning: Embedding[{j}] is not a number: {type(val)}. Converting to float.")
+                        try:
+                            embedding[j] = float(val)
+                        except:
+                            embedding[j] = 0.0
+                
+                # Create a valid UUID for the point ID
+                point_id = str(uuid.uuid4())  # Always use UUID format
+                
+                # Create point
                 points.append(
                     models.PointStruct(
-                        id=metadata.get("id_prefix", 0) + i,
-                        vector=embedding,
+                        id=point_id,
+                        vector=embedding,  # Now properly converted to list of floats
                         payload={
                             "text": chunk,
                             "source_image": metadata.get("source_image", "unknown"),
-                            "chunk_index": i,
-                            "chunk_level": metadata.get("chunk_level", "document")
+                            "chunk_index": batch_start + i,
+                            "chunk_level": metadata.get("chunk_level", "document"),
+                            "original_id": f"{metadata.get('id_prefix', 'chunk')}_{batch_start + i}"  # Store original ID in payload
                         }
                     )
                 )
-
-        # Upload points to Qdrant
-        if points:
-            qdrant_client.upsert(
-                collection_name=QDRANT_COLLECTION,
-                points=points
-            )
-            return len(points)
-        return 0
+            
+            # Upload batch to Qdrant
+            if points:
+                qdrant_client.upsert(
+                    collection_name=QDRANT_COLLECTION,
+                    points=points
+                )
+                stored_count += len(points)
+                print(f"Stored batch of {len(points)} points (total: {stored_count}/{total_chunks})")
+                
+                # Small delay to avoid API rate limits if needed
+                time.sleep(0.5)
+        
+        return stored_count
     except Exception as e:
         print(f"Error storing data in Qdrant: {e}")
+        traceback.print_exc()
         return 0
 
-def advanced_search(query, filters=None, min_score=MIN_SIMILARITY_SCORE, limit=5):
+def advanced_search(qdrant_client, query, filters=None, min_score=MIN_SIMILARITY_SCORE, limit=5):
     """Search with filtering and score thresholds"""
     try:
         query_embedding = get_embedding(query)
@@ -302,54 +369,56 @@ def advanced_search(query, filters=None, min_score=MIN_SIMILARITY_SCORE, limit=5
         print(f"Error in advanced search: {e}")
         return []
 
-def retrieve_and_generate(query, filters=None):
+def retrieve_and_generate(qdrant_client, query, filters=None):
     """Retrieve relevant context and generate an answer"""
     try:
-        results = advanced_search(query, filters=filters)
+        results = advanced_search(qdrant_client, query, filters=filters)
         if not results:
             return "No relevant information found."
 
         # Combine results into context
-        context = "\n\n".join([f"[From {r['source_image']}]\n{r['text']}" for r in results])
-        prompt = f"Answer the following question based on the context:\nQuestion: {query}\nContext: {context}"
+        context = "\n\n".join([f"[From {r['source_image']}, Score: {r['score']:.2f}]\n{r['text']}" for r in results])
+        prompt = f"""
+        Based on the following context, answer this question: {query}
+        
+        Context:
+        {context}
+        
+        Please provide a concise, accurate answer based only on the information in the context.
+        """
 
         response = generation_model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
         print(f"Error retrieving and generating response: {e}")
-        return "Error generating response."
+        return f"Error generating response: {str(e)}"
 
-def main():
-    # Create images folder if it doesn't exist
+if __name__ == "__main__":
+    # Create output folder if it doesn't exist
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-    #image_paths = pdf_to_images(PDF_PATH, OUTPUT_FOLDER)
-    print("Starting image processing...")
+    
     # Find all images
     image_paths = [
         os.path.join(OUTPUT_FOLDER, filename)
         for filename in os.listdir(OUTPUT_FOLDER)
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.tif'))
     ]
-
+    
     if not image_paths:
-        print("No images found in the 'images' folder.")
-        return
-
-    # Set up Qdrant collection
-    if not setup_qdrant_collection():
-        print("Failed to set up Qdrant collection.")
-        return
-
-    # Process images in batches with progress tracking
+        print(f"No image files found in the '{OUTPUT_FOLDER}' folder.")
+        exit(1)
+    
+    # Process images in batches
     print(f"Processing {len(image_paths)} images in batches of {BATCH_SIZE}...")
+    
     extracted_texts = {}
     
     # Create batches
     batches = [image_paths[i:i+BATCH_SIZE] for i in range(0, len(image_paths), BATCH_SIZE)]
     
-    # Process each batch with progress bar
-    for batch in tqdm(batches, desc="Processing image batches"):
+    # Process each batch
+    for i, batch in enumerate(batches):
+        print(f"Processing batch {i+1}/{len(batches)} ({len(batch)} images)...")
         batch_results = process_image_batch(batch)
         extracted_texts.update(batch_results)
     
@@ -359,53 +428,63 @@ def main():
 
     if not extracted_texts:
         print("No text extracted from images.")
-        return
+        exit(1)
 
     # Save combined text to file
-    combined_text = "\n\n".join(extracted_texts.values())
+    combined_text = "\n\n".join([f"[From {os.path.basename(img_path)}]\n{text}" for img_path, text in extracted_texts.items()])
     with open(OUTPUT_TEXT_FILE, "w", encoding="utf-8") as f:
         f.write(combined_text)
     print(f"✓ Extracted text saved to {OUTPUT_TEXT_FILE}")
-
-    # Process and store text chunks
-    total_chunks = 0
-    chunk_id_counter = 0
     
-    # Process text chunks with progress bar
-    for image_path, text in tqdm(extracted_texts.items(), desc="Processing Text Chunks"):
+    # Initialize Qdrant client with local storage
+    os.makedirs(QDRANT_LOCAL_PATH, exist_ok=True)
+    qdrant_client = QdrantClient(path=QDRANT_LOCAL_PATH)
+    
+    # Setup collection
+    if not setup_qdrant_collection(qdrant_client):
+        print("Failed to set up Qdrant collection.")
+        exit(1)
+    
+    # Process and store text chunks
+    print("Processing text chunks and storing in Qdrant...")
+    total_chunks = 0
+    
+    # Process each image's text separately
+    for image_path, text in extracted_texts.items():
         source_image = os.path.basename(image_path)
-
-        # Create semantic chunks
+        print(f"Processing text from {source_image}...")
+        
+        # Create semantic chunks with improved chunking algorithm
         chunks = recursive_chunk_text(text)
-
-        # Store chunks in Qdrant with unique IDs
+        print(f"Created {len(chunks)} chunks from {source_image}")
+        
+        # Store chunks in Qdrant with metadata
         metadata = {
             "source_image": source_image,
             "chunk_level": "semantic",
-            "id_prefix": chunk_id_counter
+            "id_prefix": f"img_{image_paths.index(image_path)}"
         }
-        stored_chunks = store_chunks_in_qdrant(chunks, metadata)
+        
+        stored_chunks = store_chunks_in_qdrant(qdrant_client, chunks, metadata)
         total_chunks += stored_chunks
-        chunk_id_counter += len(chunks)
-
+    
     # Show completion summary
     print(f"✓ Completed storing {total_chunks} chunks in Qdrant")
-    print(f"✓ All processing tasks completed successfully!")
-
-    # Example query
+    
+    # Run a sample query
     if total_chunks > 0:
-        print("\nTesting search and retrieval:")
+        print("\n--- Sample Query Results ---")
         query = "What is the main topic of these documents?"
         print(f"Query: {query}")
-        answer = retrieve_and_generate(query)
+        answer = retrieve_and_generate(qdrant_client, query)
         print(f"Answer: {answer}")
-
-        # Example filtered search
+        
+        # Example filtered search for a specific image
         if len(image_paths) > 1:
-            source_filter = {"source_image": os.path.basename(image_paths[0])}
-            print(f"\nFiltered search for image {source_filter['source_image']}:")
-            filtered_answer = retrieve_and_generate(query, filters=source_filter)
+            source_image = os.path.basename(image_paths[0])
+            print(f"\n--- Filtered search for image '{source_image}' ---")
+            source_filter = {"source_image": source_image}
+            filtered_answer = retrieve_and_generate(qdrant_client, query, filters=source_filter)
             print(f"Filtered answer: {filtered_answer}")
-
-if __name__ == "__main__":
-    main()
+    else:
+        print("No chunks were stored in Qdrant. Exiting.")
